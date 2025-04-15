@@ -3,18 +3,18 @@
  * Copyright (C) 2012 by Salvatore Sanfilippo <antirez@gmail.com>
  *
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
  * met:
- * 
+ *
  *  *  Redistributions of source code must retain the above copyright
  *     notice, this list of conditions and the following disclaimer.
  *
  *  *  Redistributions in binary form must reproduce the above copyright
  *     notice, this list of conditions and the following disclaimer in the
  *     documentation and/or other materials provided with the distribution.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
@@ -41,6 +41,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <mosquitto.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include "rtl-sdr.h"
@@ -74,6 +75,7 @@
 #define MODES_DEBUG_NOPREAMBLE (1<<4)
 #define MODES_DEBUG_NET (1<<5)
 #define MODES_DEBUG_JS (1<<6)
+#define MODES_DEBUG_MQTT (1<<7)
 
 /* When debug is set to MODES_DEBUG_NOPREAMBLE, the first sample must be
  * at least greater than a given level for us to dump the signal. */
@@ -185,6 +187,18 @@ struct {
     long long stat_http_requests;
     long long stat_sbs_connections;
     long long stat_out_of_phase;
+
+    /* MQTT */
+    int mqtt;                        /* Enable MQTT output. */
+    char *mqtt_host;                 /* MQTT broker hostname or IP. */
+    int mqtt_port;                   /* MQTT broker port. */
+    char *mqtt_username;             /* MQTT username. */
+    char *mqtt_password;             /* MQTT password. */
+    char *mqtt_topic;                /* MQTT topic to publish to. */
+    int mqtt_tls;                    /* Enable TLS for MQTT. */
+    char *mqtt_ca_cert;              /* CA certificate for MQTT TLS. */
+    int mqtt_verify_cert;            /* Verify MQTT broker certificate. */
+    struct mosquitto *mosq;          /* MQTT client instance. */
 } Modes;
 
 /* The struct we use to store information about a decoded message. */
@@ -243,6 +257,12 @@ int modesMessageLenByType(int type);
 void sigWinchCallback();
 int getTermRows();
 
+/* MQTT function prototypes */
+void modesInitMQTTConfig(void);
+void modesInitMQTT(void);
+void modesCleanupMQTT(void);
+void modesSendMQTTOutput(struct modesMessage *mm);
+
 /* ============================= Utility functions ========================== */
 
 static long long mstime(void) {
@@ -276,6 +296,17 @@ void modesInitConfig(void) {
     Modes.aggressive = 0;
     Modes.interactive_rows = getTermRows();
     Modes.loop = 0;
+
+    /* MQTT defaults */
+    Modes.mqtt = 0;
+    Modes.mqtt_host = NULL;
+    Modes.mqtt_port = 1883;
+    Modes.mqtt_username = NULL;
+    Modes.mqtt_password = NULL;
+    Modes.mqtt_topic = NULL;
+    Modes.mqtt_tls = 0;
+    Modes.mqtt_ca_cert = NULL;
+    Modes.mqtt_verify_cert = 0;
 }
 
 void modesInit(void) {
@@ -336,6 +367,121 @@ void modesInit(void) {
     Modes.stat_out_of_phase = 0;
     Modes.exit = 0;
 }
+
+/* Initialize MQTT settings from environment variables if not set by command-line */
+void modesInitMQTTConfig(void) {
+    if (Modes.mqtt) {
+        char *env;
+
+        /* MQTT Host */
+        if (!Modes.mqtt_host) {
+            if ((env = getenv("MQTT_HOST")) != NULL) {
+                Modes.mqtt_host = strdup(env);
+            } else {
+                Modes.mqtt_host = strdup("localhost");
+            }
+        }
+
+        /* MQTT Port */
+        if (Modes.mqtt_port == 1883) {
+            if ((env = getenv("MQTT_PORT")) != NULL) {
+                Modes.mqtt_port = atoi(env);
+            }
+        }
+
+        /* MQTT Username */
+        if (!Modes.mqtt_username && (env = getenv("MQTT_USER")) != NULL) {
+            Modes.mqtt_username = strdup(env);
+        }
+
+        /* MQTT Password */
+        if (!Modes.mqtt_password && (env = getenv("MQTT_PASSWORD")) != NULL) {
+            Modes.mqtt_password = strdup(env);
+        }
+
+        /* MQTT Topic */
+        if (!Modes.mqtt_topic) {
+            if ((env = getenv("MQTT_TOPIC")) != NULL) {
+                Modes.mqtt_topic = strdup(env);
+            } else {
+                Modes.mqtt_topic = strdup("adsb/raw");
+            }
+        }
+
+        /* MQTT TLS */
+        if (!Modes.mqtt_tls && (env = getenv("MQTT_TLS")) != NULL) {
+            Modes.mqtt_tls = (strcasecmp(env, "1") == 0 ||
+                             strcasecmp(env, "yes") == 0 ||
+                             strcasecmp(env, "true") == 0);
+        }
+
+        /* MQTT CA Certificate */
+        if (!Modes.mqtt_ca_cert && (env = getenv("MQTT_CA_CERT")) != NULL) {
+            Modes.mqtt_ca_cert = strdup(env);
+            Modes.mqtt_verify_cert = 1;
+        }
+    }
+}
+
+/* Initialize the MQTT connection */
+void modesInitMQTT(void) {
+    if (!Modes.mqtt)
+        return;
+
+    char *host = Modes.mqtt_host;
+    int port = Modes.mqtt_port;
+
+    mosquitto_lib_init();
+
+    Modes.mosq = mosquitto_new(NULL, true, NULL);
+    if (!Modes.mosq) {
+        fprintf(stderr, "Error: Out of memory when creating MQTT client.\n");
+        return;
+    }
+
+    if (Modes.mqtt_username && Modes.mqtt_password) {
+        mosquitto_username_pw_set(Modes.mosq, Modes.mqtt_username, Modes.mqtt_password);
+    }
+
+    if (Modes.mqtt_tls) {
+        mosquitto_tls_set(Modes.mosq, Modes.mqtt_ca_cert, NULL, NULL, NULL, NULL);
+        if (Modes.mqtt_verify_cert) {
+            mosquitto_tls_insecure_set(Modes.mosq, false);
+        } else {
+            mosquitto_tls_insecure_set(Modes.mosq, true);
+        }
+    }
+
+    if (mosquitto_connect(Modes.mosq, host, port, 60) != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "Error: Unable to connect to MQTT broker at %s:%d\n", host, port);
+        mosquitto_destroy(Modes.mosq);
+        Modes.mosq = NULL;
+        return;
+    }
+
+    fprintf(stderr, "Connected to MQTT broker at %s:%d\n", host, port);
+
+    // Start the network loop in a background thread
+    mosquitto_loop_start(Modes.mosq);
+}
+
+/* Clean up MQTT resources */
+void modesCleanupMQTT(void) {
+    if (Modes.mosq) {
+        mosquitto_loop_stop(Modes.mosq, true);
+        mosquitto_disconnect(Modes.mosq);
+        mosquitto_destroy(Modes.mosq);
+        Modes.mosq = NULL;
+        mosquitto_lib_cleanup();
+    }
+
+    if (Modes.mqtt_host) free(Modes.mqtt_host);
+    if (Modes.mqtt_username) free(Modes.mqtt_username);
+    if (Modes.mqtt_password) free(Modes.mqtt_password);
+    if (Modes.mqtt_topic) free(Modes.mqtt_topic);
+    if (Modes.mqtt_ca_cert) free(Modes.mqtt_ca_cert);
+}
+
 
 /* =============================== RTLSDR handling ========================== */
 
@@ -830,7 +976,7 @@ int bruteForceAP(unsigned char *msg, struct modesMessage *mm) {
         aux[lastbyte] ^= crc & 0xff;
         aux[lastbyte-1] ^= (crc >> 8) & 0xff;
         aux[lastbyte-2] ^= (crc >> 16) & 0xff;
-        
+
         /* If the obtained address exists in our cache we consider
          * the message valid. */
         addr = aux[lastbyte] | (aux[lastbyte-1] << 8) | (aux[lastbyte-2] << 16);
@@ -1237,7 +1383,7 @@ void displayModesMessage(struct modesMessage *mm) {
                 printf("    Heading: %d", mm->heading);
             }
         } else {
-            printf("    Unrecognized ME type: %d subtype: %d\n", 
+            printf("    Unrecognized ME type: %d subtype: %d\n",
                 mm->metype, mm->mesub);
         }
     } else {
@@ -1293,7 +1439,7 @@ int detectOutOfPhase(uint16_t *m) {
  * When messages are out of phase there is more uncertainty in
  * sequences of the same bit multiple times, since 11111 will be
  * transmitted as continuously altering magnitude (high, low, high, low...)
- * 
+ *
  * However because the message is out of phase some part of the high
  * is mixed in the low part, so that it is hard to distinguish if it is
  * a zero or a one.
@@ -1341,7 +1487,7 @@ void detectModeS(uint16_t *m, uint32_t mlen) {
      * 1.0 - 1.5 usec: second impulse.
      * 3.5 - 4   usec: third impulse.
      * 4.5 - 5   usec: last impulse.
-     * 
+     *
      * Since we are sampling at 2 Mhz every sample in our magnitude vector
      * is 0.5 usec, so the preamble will look like this, assuming there is
      * an impulse at offset 0 in the array:
@@ -1461,13 +1607,13 @@ good_preamble:
         /* Pack bits into bytes */
         for (i = 0; i < MODES_LONG_MSG_BITS; i += 8) {
             msg[i/8] =
-                bits[i]<<7 | 
-                bits[i+1]<<6 | 
-                bits[i+2]<<5 | 
-                bits[i+3]<<4 | 
-                bits[i+4]<<3 | 
-                bits[i+5]<<2 | 
-                bits[i+6]<<1 | 
+                bits[i]<<7 |
+                bits[i+1]<<6 |
+                bits[i+2]<<5 |
+                bits[i+3]<<4 |
+                bits[i+4]<<3 |
+                bits[i+5]<<2 |
+                bits[i+6]<<1 |
                 bits[i+7];
         }
 
@@ -1581,6 +1727,10 @@ void useModesMessage(struct modesMessage *mm) {
         /* Send data to connected clients. */
         if (Modes.net) {
             modesSendRawOutput(mm);  /* Feed raw output clients. */
+        }
+        /* Send data to MQTT broker if enabled */
+        if (Modes.mqtt && Modes.mosq) {
+            modesSendMQTTOutput(mm);
         }
     }
 }
@@ -2049,6 +2199,54 @@ void modesSendRawOutput(struct modesMessage *mm) {
     modesSendAllClients(Modes.ros, msg, p-msg);
 }
 
+/* Publish a message to the MQTT broker */
+void modesSendMQTTOutput(struct modesMessage *mm) {
+    if (!Modes.mosq || !Modes.mqtt)
+        return;
+
+    char msg[256];
+    int len = 0;
+
+    /* Format: ICAO_ADDR,MSG_TYPE,MSG_BITS,[...other fields as needed...] */
+    len = snprintf(msg, sizeof(msg), "%02X%02X%02X,%d,%d",
+                  mm->aa1, mm->aa2, mm->aa3, mm->msgtype, mm->msgbits);
+
+    /* Add more fields based on message type */
+    if (mm->msgtype == 17) {
+        len += snprintf(msg + len, sizeof(msg) - len, ",%d,%d",
+                       mm->metype, mm->mesub);
+
+        if (mm->metype >= 1 && mm->metype <= 4) {
+            /* Aircraft identification */
+            len += snprintf(msg + len, sizeof(msg) - len, ",%s", mm->flight);
+        } else if (mm->metype >= 9 && mm->metype <= 18) {
+            /* Airborne position */
+            len += snprintf(msg + len, sizeof(msg) - len, ",%d,%d,%d",
+                           mm->altitude, mm->raw_latitude, mm->raw_longitude);
+        } else if (mm->metype == 19 && mm->mesub >= 1 && mm->mesub <= 4) {
+            /* Airborne velocity */
+            len += snprintf(msg + len, sizeof(msg) - len, ",%d,%d",
+                           mm->velocity, mm->heading);
+        }
+    } else if (mm->msgtype == 0 || mm->msgtype == 4 ||
+              mm->msgtype == 16 || mm->msgtype == 20) {
+        /* Messages with altitude */
+        len += snprintf(msg + len, sizeof(msg) - len, ",%d", mm->altitude);
+    } else if (mm->msgtype == 5 || mm->msgtype == 21) {
+        /* Messages with identity/squawk */
+        len += snprintf(msg + len, sizeof(msg) - len, ",%d", mm->identity);
+    }
+
+    /* Publish the message */
+    int result = mosquitto_publish(Modes.mosq, NULL, Modes.mqtt_topic, len, msg, 0, false);
+    if (result != MOSQ_ERR_SUCCESS) {
+        if (Modes.debug & MODES_DEBUG_MQTT) {
+            fprintf(stderr, "MQTT publish error: %s\n",
+                   mosquitto_strerror(result));
+        }
+    }
+}
+
 
 /* Write SBS output to TCP clients. */
 void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a) {
@@ -2117,10 +2315,10 @@ int hexDigitVal(int c) {
  * raw hex format like: *8D4B969699155600E87406F5B69F;
  * The string is supposed to be at the start of the client buffer
  * and null-terminated.
- * 
+ *
  * The message is passed to the higher level layers, so it feeds
  * the selected screen output, the network output and so forth.
- * 
+ *
  * If the message looks invalid is silently discarded.
  *
  * The function always returns 0 (success) to the caller as there is
@@ -2565,6 +2763,7 @@ int main(int argc, char **argv) {
                 case 'p': Modes.debug |= MODES_DEBUG_NOPREAMBLE; break;
                 case 'n': Modes.debug |= MODES_DEBUG_NET; break;
                 case 'j': Modes.debug |= MODES_DEBUG_JS; break;
+                case 'm': Modes.debug |= MODES_DEBUG_MQTT; break;
                 default:
                     fprintf(stderr, "Unknown debugging flag: %c\n", *f);
                     exit(1);
@@ -2581,11 +2780,34 @@ int main(int argc, char **argv) {
             showHelp();
             exit(0);
         } else {
-            fprintf(stderr,
-                "Unknown or not enough arguments for option '%s'.\n\n",
-                argv[j]);
-            showHelp();
-            exit(1);
+            /* MQTT options */
+            if (!strcmp(argv[j], "-M")) {
+                Modes.mqtt = 1;
+            } else if (!strcmp(argv[j], "-H") && more) {
+                if (Modes.mqtt_host) free(Modes.mqtt_host);
+                Modes.mqtt_host = strdup(argv[++j]);
+            } else if (!strcmp(argv[j], "-P") && more) {
+                Modes.mqtt_port = atoi(argv[++j]);
+            } else if (!strcmp(argv[j], "-U") && more) {
+                if (Modes.mqtt_username) free(Modes.mqtt_username);
+                Modes.mqtt_username = strdup(argv[++j]);
+            } else if (!strcmp(argv[j], "-W") && more) {
+                if (Modes.mqtt_password) free(Modes.mqtt_password);
+                Modes.mqtt_password = strdup(argv[++j]);
+            } else if (!strcmp(argv[j], "-O") && more) {
+                if (Modes.mqtt_topic) free(Modes.mqtt_topic);
+                Modes.mqtt_topic = strdup(argv[++j]);
+            } else if (!strcmp(argv[j], "-L")) {
+                Modes.mqtt_tls = 1;
+            } else if (!strcmp(argv[j], "-C") && more) {
+                if (Modes.mqtt_ca_cert) free(Modes.mqtt_ca_cert);
+                Modes.mqtt_ca_cert = strdup(argv[++j]);
+                Modes.mqtt_verify_cert = 1;
+            } else {
+                fprintf(stderr, "Unknown or not enough arguments for option '%s'.\n\n", argv[j]);
+                showHelp();
+                exit(1);
+	    }
         }
     }
 
@@ -2607,6 +2829,13 @@ int main(int argc, char **argv) {
         }
     }
     if (Modes.net) modesInitNet();
+
+    /* Initialize MQTT if enabled */
+    if (Modes.mqtt) {
+        modesInitMQTTConfig();
+        modesInitMQTT();
+    }
+
 
     /* If the user specifies --net-only, just run in order to serve network
      * clients without reading data from the RTL device. */
@@ -2656,6 +2885,11 @@ int main(int argc, char **argv) {
         printf("%lld two bits errors\n", Modes.stat_two_bits_fix);
         printf("%lld total usable messages\n",
             Modes.stat_goodcrc + Modes.stat_fixed);
+    }
+
+    /* Clean up MQTT resources if enabled */
+    if (Modes.mqtt) {
+        modesCleanupMQTT();
     }
 
     rtlsdr_close(Modes.dev);

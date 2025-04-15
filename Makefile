@@ -1,5 +1,6 @@
-CFLAGS?=-O2 -g -Wall -W $(shell pkg-config --cflags librtlsdr)
-LDLIBS+=$(shell pkg-config --libs librtlsdr) -lpthread -lm
+CFLAGS?=-O2 -g -Wall -W $(shell pkg-config --cflags librtlsdr) $(shell pkg-config --cflags libmosquitto)
+LDLIBS+=$(shell pkg-config --libs librtlsdr) $(shell pkg-config --libs libmosquitto) -lpthread -lm
+
 CC?=gcc
 PROGNAME=dump1090
 
